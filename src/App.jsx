@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { syncEnabled, pullData, pushData } from "./sync";
 
 /* ── Design Tokens ── */
 const BG = "#E0E5EC";
@@ -599,6 +600,63 @@ function StatsView(props) {
   );
 }
 
+/* ── Sync Modal ── */
+function SyncModal(props) {
+  var [input, setInput] = useState("");
+  var [err, setErr] = useState("");
+  var current = props.current;
+
+  function save() {
+    var v = input.trim();
+    if (v.length < 8) { setErr("PIN 至少 8 位"); return; }
+    if (!/^[A-Za-z0-9]+$/.test(v)) { setErr("只能用字母和数字"); return; }
+    props.onSave(v);
+  }
+  function clear() {
+    if (confirm("断开云同步？本机数据会保留，但不再同步到云端。")) {
+      props.onSave("");
+    }
+  }
+
+  var masked = current ? current.slice(0, 2) + "•".repeat(Math.max(0, current.length - 4)) + current.slice(-2) : "";
+
+  return (
+    <div onClick={props.onClose} style={{ position: "fixed", inset: 0, background: "rgba(61,72,82,0.4)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={function (e) { e.stopPropagation(); }} style={{ ...sCard, padding: 24, maxWidth: 360, width: "100%" }}>
+        <h2 style={{ ...sH2, fontSize: 18, marginBottom: 8 }}>☁️ 云同步</h2>
+        <p style={{ ...sM, fontSize: 12, marginBottom: 16, lineHeight: 1.6 }}>
+          设置一个 8 位以上的 PIN 码（字母+数字），在手机、电脑输入同一个 PIN 即可同步数据。<br />
+          <span style={{ color: "#D4628A" }}>⚠️ PIN 就是你的钥匙，别告诉别人。</span>
+        </p>
+
+        {current && (
+          <div style={{ ...sIns, padding: "10px 14px", marginBottom: 12, fontFamily: FB, fontSize: 13, color: FG }}>
+            当前 PIN：<span style={{ fontWeight: 700 }}>{masked}</span>
+          </div>
+        )}
+
+        <input
+          type="text"
+          placeholder={current ? "输入新 PIN 替换" : "输入 PIN（至少 8 位）"}
+          value={input}
+          onChange={function (e) { setInput(e.target.value); setErr(""); }}
+          style={{ ...sInp, marginBottom: 8 }}
+          autoFocus
+        />
+        {err && <div style={{ color: "#D4628A", fontSize: 12, marginBottom: 8, fontFamily: FB }}>{err}</div>}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <button onClick={props.onClose} style={{ ...sBtn, flex: 1, padding: "10px 14px", fontSize: 13 }}>取消</button>
+          <button onClick={save} style={{ ...sBtnA, flex: 2, padding: "10px 14px", fontSize: 13 }}>{current ? "更换 PIN" : "启用同步"}</button>
+        </div>
+        {current && (
+          <button onClick={clear} style={{ ...sBtn, width: "100%", padding: "8px 14px", fontSize: 12, marginTop: 8, color: MU }}>断开云同步</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ── Main App ── */
 export default function App() {
   var [tab, setTab] = useState("today");
@@ -609,6 +667,12 @@ export default function App() {
   var [userMats, setUserMats, c5] = useStore("oet-um", []);
   var [viewDay, setViewDay] = useState(null);
 
+  /* Sync state */
+  var [pin, setPin] = useState(function () { try { return localStorage.getItem("oet-pin") || ""; } catch (e) { return ""; } });
+  var [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
+  var [showSync, setShowSync] = useState(false);
+  var pullDoneRef = useRef(false);
+
   var loaded = c1 && c2 && c3 && c4 && c5;
 
   function handleCheck(day) {
@@ -616,6 +680,72 @@ export default function App() {
     if (day === curDay && curDay < 30) {
       setCurDay(function (prev) { return prev + 1; });
     }
+  }
+
+  /* Pull on mount / pin change */
+  useEffect(function () {
+    if (!syncEnabled || !pin) { pullDoneRef.current = true; return; }
+    pullDoneRef.current = false;
+    setSyncStatus("syncing");
+    var localUpdatedAt = "";
+    try { localUpdatedAt = localStorage.getItem("oet-updated-at") || ""; } catch (e) {}
+    pullData(pin).then(function (row) {
+      if (row && (row.updated_at || "") > localUpdatedAt) {
+        var d = row.data || {};
+        if (Array.isArray(d.checked)) setChecked(d.checked);
+        if (Array.isArray(d.exprs)) setExprs(d.exprs);
+        if (typeof d.curDay === "number") setCurDay(d.curDay);
+        if (Array.isArray(d.topics)) setTopics(d.topics);
+        if (Array.isArray(d.userMats)) setUserMats(d.userMats);
+        try { localStorage.setItem("oet-updated-at", row.updated_at); } catch (e) {}
+        setSyncStatus("synced");
+        pullDoneRef.current = true;
+      } else if (!row) {
+        // First time: no cloud data, push local so other devices can pull it
+        pushData(pin, { checked: checked, exprs: exprs, curDay: curDay, topics: topics, userMats: userMats }).then(function (ts) {
+          try { localStorage.setItem("oet-updated-at", ts); } catch (e) {}
+          setSyncStatus("synced");
+          pullDoneRef.current = true;
+        }).catch(function (e) {
+          console.error("initial push failed", e);
+          setSyncStatus("error");
+          pullDoneRef.current = true;
+        });
+      } else {
+        // Local is newer or equal; nothing to apply
+        setSyncStatus("synced");
+        pullDoneRef.current = true;
+      }
+    }).catch(function (e) {
+      console.error("pull failed", e);
+      setSyncStatus("error");
+      pullDoneRef.current = true;
+    });
+  }, [pin]);
+
+  /* Debounced push on data change */
+  useEffect(function () {
+    if (!syncEnabled || !pin || !pullDoneRef.current) return;
+    var handle = setTimeout(function () {
+      setSyncStatus("syncing");
+      pushData(pin, { checked: checked, exprs: exprs, curDay: curDay, topics: topics, userMats: userMats }).then(function (ts) {
+        try { localStorage.setItem("oet-updated-at", ts); } catch (e) {}
+        setSyncStatus("synced");
+      }).catch(function (e) {
+        console.error("push failed", e);
+        setSyncStatus("error");
+      });
+    }, 1500);
+    return function () { clearTimeout(handle); };
+  }, [pin, checked, exprs, curDay, topics, userMats]);
+
+  function savePin(newPin) {
+    try {
+      if (newPin) localStorage.setItem("oet-pin", newPin);
+      else { localStorage.removeItem("oet-pin"); localStorage.removeItem("oet-updated-at"); }
+    } catch (e) {}
+    setPin(newPin);
+    setShowSync(false);
   }
 
   if (!loaded) {
@@ -626,14 +756,27 @@ export default function App() {
 
   var displayDay = viewDay || curDay;
 
+  var syncLabel = !syncEnabled ? "" : !pin ? "☁️ 同步" : syncStatus === "syncing" ? "↻ 同步中" : syncStatus === "error" ? "⚠ 失败" : "✓ 已同步";
+  var syncColor = syncStatus === "error" ? "#D4628A" : syncStatus === "synced" && pin ? OK : MU;
+
   return (
     <div style={{ minHeight: "100vh", background: BG, paddingBottom: 20 }}>
       <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=DM+Sans:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
 
-      <div style={{ padding: "24px 16px 8px", textAlign: "center" }}>
+      <div style={{ padding: "24px 16px 8px", textAlign: "center", position: "relative" }}>
         <h1 style={{ ...sH1, fontSize: 20, letterSpacing: "0.08em" }}>ORAL ENGLISH</h1>
         <p style={{ ...sM, fontSize: 10, letterSpacing: "0.2em", marginTop: 2 }}>30-DAY CHALLENGE</p>
+        {syncEnabled && (
+          <button
+            onClick={function () { setShowSync(true); }}
+            style={{ position: "absolute", top: 24, right: 12, ...sBtn, padding: "6px 10px", fontSize: 11, color: syncColor, whiteSpace: "nowrap" }}
+          >
+            {syncLabel}
+          </button>
+        )}
       </div>
+
+      {showSync && <SyncModal current={pin} onClose={function () { setShowSync(false); }} onSave={savePin} />}
 
       <TabBar active={tab} onChange={function (t) { setTab(t); setViewDay(null); }} />
 
